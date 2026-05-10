@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: movie_ticket_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: movie_ticket_system
+      MYSQL_USER: movie
+      MYSQL_PASSWORD: movie123456
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - movie-network
+
+  backend:
+    build: ./backend
+    container_name: movie_ticket_backend
+    restart: always
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: movie_ticket_system
+      DB_USER: movie
+      DB_PASSWORD: movie123456
+      JWT_SECRET: your_super_secret_jwt_key_here
+      JWT_EXPIRES_IN: 7d
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mysql
+    networks:
+      - movie-network
+
+  frontend:
+    build: ./frontend
+    container_name: movie_ticket_frontend
+    restart: always
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - movie-network
+
+volumes:
+  mysql_data:
+
+networks:
+  movie-network:
+    driver: bridge
