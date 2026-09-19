@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { createOrder, payOrder, getOrderDetail } from '../api/order'
+import { removeConflictedSelection } from '../utils/seatMap'
 
 export const useTicketStore = defineStore('ticket', () => {
   const selectedMovie = ref(null)
@@ -39,6 +40,15 @@ export const useTicketStore = defineStore('ticket', () => {
 
   const clearSelection = () => {
     selectedSeats.value = []
+  }
+
+  // 服务端返回座位冲突时，把冲突座位从已选中移除（以服务端为准）
+  const removeConflictedSeats = (conflictSeats) => {
+    const remainingIds = removeConflictedSelection(
+      selectedSeats.value.map(s => s.id),
+      conflictSeats
+    )
+    selectedSeats.value = selectedSeats.value.filter(s => remainingIds.includes(s.id))
   }
 
   const createOrderAction = async () => {
@@ -82,6 +92,7 @@ export const useTicketStore = defineStore('ticket', () => {
     toggleSeat,
     isSeatSelected,
     clearSelection,
+    removeConflictedSeats,
     createOrderAction,
     payOrderAction,
     getOrderDetailAction,

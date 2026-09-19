@@ -105,6 +105,27 @@ const updateShowtime = async (req, res) => {
   const { movie_id, hall_id, start_time, end_time, ticket_price } = req.body;
 
   try {
+    const [existing] = await pool.query('SELECT * FROM showtimes WHERE id = ?', [id]);
+    if (existing.length === 0) {
+      return res.status(404).json({ message: '场次不存在' });
+    }
+
+    // 更换影厅等于覆盖座位布局：若该场次存在被锁定(reserved)或已售(sold)的座位则拒绝
+    if (Number(hall_id) !== Number(existing[0].hall_id)) {
+      const [heldSeats] = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM order_seats WHERE showtime_id = ? AND status IN ('reserved', 'sold')`,
+        [id]
+      );
+      if (heldSeats[0].cnt > 0) {
+        return res.status(409).json({
+          code: 'SHOWTIME_SEATS_HELD',
+          message: `场次 ${id} 存在被锁定或已售的座位，不能更换影厅/座位布局`,
+          showtime_id: Number(id),
+          held_seat_count: heldSeats[0].cnt
+        });
+      }
+    }
+
     const [result] = await pool.query(
       'UPDATE showtimes SET movie_id = ?, hall_id = ?, start_time = ?, end_time = ?, ticket_price = ? WHERE id = ?',
       [movie_id, hall_id, start_time, end_time, ticket_price, id]
@@ -125,6 +146,19 @@ const deleteShowtime = async (req, res) => {
   const { id } = req.params;
 
   try {
+    const [heldSeats] = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM order_seats WHERE showtime_id = ? AND status IN ('reserved', 'sold')`,
+      [id]
+    );
+    if (heldSeats[0].cnt > 0) {
+      return res.status(409).json({
+        code: 'SHOWTIME_SEATS_HELD',
+        message: `场次 ${id} 存在被锁定或已售的座位，不能删除`,
+        showtime_id: Number(id),
+        held_seat_count: heldSeats[0].cnt
+      });
+    }
+
     const [result] = await pool.query('DELETE FROM showtimes WHERE id = ?', [id]);
 
     if (result.affectedRows === 0) {

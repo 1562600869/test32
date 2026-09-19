@@ -11,13 +11,33 @@
         <div class="spinner"></div>
       </div>
 
+      <div v-else-if="loadError" class="error-state card" role="alert">
+        <div class="error-icon">⚠️</div>
+        <p class="error-message">{{ loadError.message }}</p>
+        <button v-if="loadError.retryable" class="btn btn-primary" @click="loadData">
+          重试
+        </button>
+        <button class="btn btn-secondary" @click="goBack">返回</button>
+      </div>
+
+      <div v-else-if="seats.length === 0" class="empty-state card">
+        <div class="empty-icon">🪑</div>
+        <p class="empty-message">该场次暂无可用座位信息</p>
+        <button class="btn btn-primary" @click="loadData">重新加载</button>
+      </div>
+
       <div v-else class="seat-container">
         <div class="screen">
           <div class="screen-label">银 幕</div>
         </div>
 
         <div class="seat-map-wrapper">
-          <svg :viewBox="svgViewBox" class="seat-map">
+          <svg
+            :viewBox="svgViewBox"
+            class="seat-map"
+            role="group"
+            :aria-label="`座位图，共 ${rows.length} 排，已选 ${ticketStore.selectedSeats.length} 个座位`"
+          >
             <g v-for="row in rows" :key="'row-' + row">
               <text 
                 :x="labelX" 
@@ -34,7 +54,15 @@
               v-for="seat in seats" 
               :key="seat.id"
               class="seat-group"
+              :class="{ 'seat-disabled': seat.is_sold }"
+              role="button"
+              :tabindex="seat.is_sold ? -1 : 0"
+              :aria-label="getSeatAriaLabel(seat)"
+              :aria-pressed="ticketStore.isSeatSelected(seat.id)"
+              :aria-disabled="seat.is_sold"
               @click="handleSeatClick(seat)"
+              @keydown.enter.prevent="handleSeatClick(seat)"
+              @keydown.space.prevent="handleSeatClick(seat)"
             >
               <rect
                 :x="getSeatX(seat.col_number)"
@@ -58,6 +86,10 @@
           </svg>
         </div>
 
+        <div class="sr-only" aria-live="polite">
+          已选 {{ ticketStore.selectedSeats.length }} 个座位{{ selectedSeatsText ? '：' + selectedSeatsText : '' }}
+        </div>
+
         <div class="legend">
           <div class="legend-item">
             <div class="legend-seat available"></div>
@@ -76,6 +108,12 @@
             <span>VIP座</span>
           </div>
         </div>
+      </div>
+
+      <div v-if="orderError" class="order-error card" role="alert">
+        <span class="order-error-icon">⚠️</span>
+        <span class="order-error-text">{{ orderError }}</span>
+        <button class="order-error-close" aria-label="关闭错误提示" @click="orderError = ''">×</button>
       </div>
 
       <div class="order-summary card">
@@ -116,6 +154,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getShowtimeById } from '../../api/showtime'
 import { useTicketStore } from '../../stores/ticket'
+import { classifyApiError, formatSeatConflictMessage } from '../../utils/apiErrors'
+import { markSeatsUnavailable, seatAriaLabel } from '../../utils/seatMap'
 
 const route = useRoute()
 const router = useRouter()
@@ -125,6 +165,8 @@ const showtime = ref(null)
 const seats = ref([])
 const loading = ref(true)
 const processing = ref(false)
+const loadError = ref(null)
+const orderError = ref('')
 
 const seatWidth = 32
 const seatHeight = 32
@@ -184,6 +226,10 @@ const getSeatClass = (seat) => {
   return classes
 }
 
+const getSeatAriaLabel = (seat) => {
+  return seatAriaLabel(seat, ticketStore.isSeatSelected(seat.id))
+}
+
 const selectedSeatsText = computed(() => {
   return ticketStore.selectedSeats
     .sort((a, b) => {
@@ -201,6 +247,7 @@ const formatTime = (datetime) => {
 
 const handleSeatClick = (seat) => {
   if (seat.is_sold) return
+  orderError.value = ''
   ticketStore.toggleSeat(seat)
 }
 
@@ -208,39 +255,74 @@ const confirmOrder = async () => {
   if (ticketStore.selectedSeats.length === 0) return
   
   processing.value = true
+  orderError.value = ''
   try {
     const order = await ticketStore.createOrderAction()
     router.push(`/payment/${order.order_no}`)
   } catch (error) {
-    alert(error.message || '创建订单失败，请重试')
-    console.error(error)
+    if (error && error.code === 'SEAT_CONFLICT') {
+      // 冲突座位立即在本地置为不可选、移出已选，再以服务端数据为准刷新
+      const conflictSeats = error.conflict_seats || []
+      seats.value = markSeatsUnavailable(seats.value, conflictSeats)
+      ticketStore.removeConflictedSeats(conflictSeats)
+      orderError.value = formatSeatConflictMessage(error)
+      refreshSeats()
+    } else {
+      orderError.value = classifyApiError(error).message
+    }
   } finally {
     processing.value = false
   }
 }
 
+// 静默刷新座位图（以服务端为准），不改变页面加载态
+const refreshSeats = async () => {
+  try {
+    const res = await getShowtimeById(route.params.id)
+    showtime.value = res.showtime
+    seats.value = res.seats
+  } catch (error) {
+    // 静默刷新失败不覆盖当前页面，只记录
+    console.warn('座位图刷新失败:', error)
+  }
+}
+
 const loadData = async () => {
   loading.value = true
+  loadError.value = null
   try {
     const res = await getShowtimeById(route.params.id)
     showtime.value = res.showtime
     seats.value = res.seats
     ticketStore.setShowtime(res.showtime)
   } catch (error) {
-    console.error('加载数据失败:', error)
-    alert('加载数据失败，请重试')
+    loadError.value = classifyApiError(error)
   } finally {
     loading.value = false
+  }
+}
+
+const goBack = () => {
+  router.back()
+}
+
+// 跨标签页规则：以服务端为准。页面重新可见时静默刷新座位图，
+// 另一标签页的锁定/购票结果会反映到当前座位图。
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible' && !loading.value && !loadError.value) {
+    refreshSeats()
   }
 }
 
 onMounted(() => {
   ticketStore.clearSelection()
   loadData()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onUnmounted(() => {
   ticketStore.clearSelection()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
 
@@ -304,6 +386,81 @@ onUnmounted(() => {
 
 .seat-group {
   cursor: pointer;
+}
+
+.seat-group.seat-disabled {
+  cursor: not-allowed;
+}
+
+.seat-group:focus-visible {
+  outline: 2px solid #e94560;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.error-state,
+.empty-state {
+  max-width: 480px;
+  margin: 40px auto;
+  padding: 48px 32px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.error-icon,
+.empty-icon {
+  font-size: 48px;
+}
+
+.error-message {
+  color: #ff6b6b;
+  font-size: 15px;
+}
+
+.empty-message {
+  color: #888;
+  font-size: 15px;
+}
+
+.order-error {
+  max-width: 900px;
+  margin: 0 auto 16px;
+  padding: 14px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.08);
+}
+
+.order-error-text {
+  flex: 1;
+  color: #ff6b6b;
+  font-size: 14px;
+}
+
+.order-error-close {
+  background: none;
+  border: none;
+  color: #ff6b6b;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
 }
 
 .seat {

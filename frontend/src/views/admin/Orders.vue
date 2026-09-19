@@ -8,6 +8,7 @@
           <option value="pending">待支付</option>
           <option value="paid">已支付</option>
           <option value="cancelled">已取消</option>
+          <option value="expired">已过期</option>
           <option value="refunded">已退款</option>
         </select>
       </div>
@@ -85,6 +86,7 @@ const statusMap = {
   pending: '待支付',
   paid: '已支付',
   cancelled: '已取消',
+  expired: '已过期',
   refunded: '已退款'
 }
 

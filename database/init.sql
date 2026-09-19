@@ -75,8 +75,9 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id INT NOT NULL,
     showtime_id INT NOT NULL,
     total_amount DECIMAL(10, 2) NOT NULL,
-    status ENUM('pending', 'paid', 'cancelled', 'refunded') DEFAULT 'pending',
+    status ENUM('pending', 'paid', 'expired', 'cancelled', 'refunded') DEFAULT 'pending',
     version INT DEFAULT 0,
+    expires_at DATETIME NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     paid_at TIMESTAMP NULL,
@@ -93,14 +94,15 @@ CREATE TABLE IF NOT EXISTS order_seats (
     order_id INT NOT NULL,
     showtime_id INT NOT NULL,
     seat_id INT NOT NULL,
-    status ENUM('reserved', 'sold', 'cancelled') DEFAULT 'reserved',
+    status ENUM('reserved', 'sold', 'expired', 'cancelled') DEFAULT 'reserved',
     version INT DEFAULT 0,
+    active_flag TINYINT GENERATED ALWAYS AS (CASE WHEN status IN ('reserved', 'sold') THEN 1 ELSE NULL END) STORED,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
     FOREIGN KEY (showtime_id) REFERENCES showtimes(id) ON DELETE CASCADE,
     FOREIGN KEY (seat_id) REFERENCES seat_layouts(id) ON DELETE CASCADE,
-    UNIQUE KEY unique_showtime_seat (showtime_id, seat_id, status),
+    UNIQUE KEY unique_active_showtime_seat (showtime_id, seat_id, active_flag),
     INDEX idx_showtime_seat (showtime_id, seat_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

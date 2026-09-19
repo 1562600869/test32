@@ -98,6 +98,7 @@ const statusMap = {
   pending: { text: '待支付', class: 'pending' },
   paid: { text: '已支付', class: 'paid' },
   cancelled: { text: '已取消', class: 'cancelled' },
+  expired: { text: '已过期', class: 'expired' },
   refunded: { text: '已退款', class: 'refunded' }
 }
 
@@ -185,6 +186,7 @@ onMounted(() => {
 }
 
 .status-badge.cancelled,
+.status-badge.expired,
 .status-badge.refunded {
   background: rgba(134, 142, 150, 0.2);
   color: #868e96;

@@ -1,6 +1,36 @@
 const pool = require('../database');
 const { generateOrderNo } = require('../utils/orderNo');
 
+const LOCK_TTL_MINUTES = 15;
+
+const findConflictSeats = async (connection, showtimeId, seatIds) => {
+  const placeholders = seatIds.map(() => '?').join(',');
+  const [rows] = await connection.query(
+    `SELECT sl.id AS seat_id, sl.row_number AS row, sl.col_number AS col, os.status AS held_status
+     FROM seat_layouts sl
+     JOIN order_seats os ON os.seat_id = sl.id AND os.showtime_id = ? AND os.status IN ('reserved', 'sold')
+     WHERE sl.id IN (${placeholders})`,
+    [showtimeId, ...seatIds]
+  );
+  return rows;
+};
+
+const seatConflictResponse = (res, showtimeId, conflictSeats) => {
+  return res.status(409).json({
+    code: 'SEAT_CONFLICT',
+    message: `场次 ${showtimeId} 的部分座位已被其他用户锁定或售出：${
+      conflictSeats.map(s => `${s.row}排${s.col}座`).join('、')
+    }`,
+    showtime_id: showtimeId,
+    conflict_seats: conflictSeats.map(s => ({
+      seat_id: s.seat_id,
+      row: s.row,
+      col: s.col,
+      held_status: s.held_status
+    }))
+  });
+};
+
 const createOrder = async (req, res) => {
   const { showtime_id, seat_ids } = req.body;
   const userId = req.user.id;
@@ -42,22 +72,18 @@ const createOrder = async (req, res) => {
 
     const unavailableSeats = seats.filter(s => s.is_sold);
     if (unavailableSeats.length > 0) {
+      const conflictSeats = await findConflictSeats(connection, showtime_id, seat_ids);
       await connection.rollback();
-      return res.status(400).json({ 
-        message: '部分座位已被售出',
-        unavailable_seats: unavailableSeats.map(s => ({
-          row: s.row_number,
-          col: s.col_number
-        }))
-      });
+      return seatConflictResponse(res, showtime_id, conflictSeats);
     }
 
     const totalAmount = showtime.ticket_price * seat_ids.length;
     const orderNo = generateOrderNo();
 
     const [orderResult] = await connection.query(
-      'INSERT INTO orders (order_no, user_id, showtime_id, total_amount, status, version) VALUES (?, ?, ?, ?, ?, ?)',
-      [orderNo, userId, showtime_id, totalAmount, 'pending', 0]
+      `INSERT INTO orders (order_no, user_id, showtime_id, total_amount, status, version, expires_at)
+       VALUES (?, ?, ?, ?, 'pending', 0, DATE_ADD(NOW(), INTERVAL ? MINUTE))`,
+      [orderNo, userId, showtime_id, totalAmount, LOCK_TTL_MINUTES]
     );
 
     const orderId = orderResult.insertId;
@@ -77,6 +103,7 @@ const createOrder = async (req, res) => {
         order_no: orderNo,
         total_amount: totalAmount,
         status: 'pending',
+        lock_ttl_minutes: LOCK_TTL_MINUTES,
         seats: seats.map(s => ({
           id: s.id,
           row: s.row_number,
@@ -90,7 +117,18 @@ const createOrder = async (req, res) => {
     console.error(error);
     
     if (error.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ message: '座位已被其他用户锁定，请重新选择' });
+      try {
+        const conflictSeats = await findConflictSeats(pool, showtime_id, seat_ids);
+        return seatConflictResponse(res, showtime_id, conflictSeats);
+      } catch (lookupError) {
+        console.error(lookupError);
+        return res.status(409).json({
+          code: 'SEAT_CONFLICT',
+          message: `场次 ${showtime_id} 的座位已被其他用户锁定，请重新选择`,
+          showtime_id,
+          conflict_seats: []
+        });
+      }
     }
     
     res.status(500).json({ message: '服务器内部错误' });
@@ -119,36 +157,66 @@ const payOrder = async (req, res) => {
 
     const order = orders[0];
 
+    if (order.status === 'paid') {
+      await connection.commit();
+      return res.json({
+        message: '订单已支付，请勿重复操作',
+        order_no,
+        already_paid: true
+      });
+    }
+
     if (order.status !== 'pending') {
       await connection.rollback();
-      return res.status(400).json({ message: '订单状态不允许支付' });
+      return res.status(400).json({
+        code: 'ORDER_NOT_PAYABLE',
+        message: `订单状态为 ${order.status}，不允许支付`,
+        order_status: order.status
+      });
     }
 
     const currentTime = new Date();
-    const orderTime = new Date(order.created_at);
-    const diffMinutes = (currentTime - orderTime) / (1000 * 60);
+    const expiresAt = order.expires_at
+      ? new Date(order.expires_at)
+      : new Date(new Date(order.created_at).getTime() + LOCK_TTL_MINUTES * 60 * 1000);
 
-    if (diffMinutes > 15) {
+    if (currentTime > expiresAt) {
       await connection.query(
-        'UPDATE orders SET status = ? WHERE id = ?',
-        ['cancelled', order.id]
+        `UPDATE orders SET status = 'expired', version = version + 1 WHERE id = ? AND status = 'pending'`,
+        [order.id]
       );
       await connection.query(
-        'UPDATE order_seats SET status = ? WHERE order_id = ?',
-        ['cancelled', order.id]
+        `UPDATE order_seats SET status = 'expired', version = version + 1 WHERE order_id = ? AND status = 'reserved'`,
+        [order.id]
       );
       await connection.commit();
-      return res.status(400).json({ message: '订单已超时取消' });
+      return res.status(400).json({
+        code: 'ORDER_EXPIRED',
+        message: '订单已超时，座位锁定已释放，请重新下单',
+        order_status: 'expired'
+      });
     }
 
     const [updateResult] = await connection.query(
-      'UPDATE orders SET status = ?, paid_at = ?, version = version + 1 WHERE id = ? AND version = ?',
-      ['paid', new Date(), order.id, order.version]
+      `UPDATE orders SET status = 'paid', paid_at = NOW(), version = version + 1 WHERE id = ? AND status = 'pending'`,
+      [order.id]
     );
 
     if (updateResult.affectedRows === 0) {
+      const [fresh] = await connection.query('SELECT status FROM orders WHERE id = ?', [order.id]);
+      if (fresh.length > 0 && fresh[0].status === 'paid') {
+        await connection.commit();
+        return res.json({
+          message: '订单已支付，请勿重复操作',
+          order_no,
+          already_paid: true
+        });
+      }
       await connection.rollback();
-      return res.status(400).json({ message: '订单已被其他操作处理，请重试' });
+      return res.status(409).json({
+        code: 'ORDER_STATE_CONFLICT',
+        message: '订单已被其他操作处理，请刷新后重试'
+      });
     }
 
     const [seatUpdateResult] = await connection.query(

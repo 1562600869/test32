@@ -13,7 +13,10 @@
         <div v-else-if="error" class="error-section">
           <div class="error-icon">❌</div>
           <p class="error-text">{{ error }}</p>
-          <button class="btn btn-primary" @click="goHome">返回首页</button>
+          <div class="error-actions">
+            <button class="btn btn-primary" @click="loadOrder">重试</button>
+            <button class="btn btn-secondary" @click="goHome">返回首页</button>
+          </div>
         </div>
 
         <div v-else class="payment-content">
@@ -97,6 +100,7 @@
               <span v-else>立即支付 ¥{{ order?.total_amount }}</span>
             </button>
           </div>
+          <p v-if="payError" class="pay-error" role="alert">{{ payError }}</p>
         </div>
       </div>
     </div>
@@ -106,8 +110,11 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getOrderDetail, cancelOrder as cancelOrderApi } from '../../api/order'
+import { getOrderDetail, payOrder, cancelOrder as cancelOrderApi } from '../../api/order'
 import { useTicketStore } from '../../stores/ticket'
+import { getRemainingSeconds } from '../../utils/orderStateMachine'
+import { createPaymentSubmitter } from '../../utils/paymentSubmitter'
+import { classifyApiError } from '../../utils/apiErrors'
 
 const route = useRoute()
 const router = useRouter()
@@ -120,8 +127,12 @@ const error = ref('')
 const processing = ref(false)
 const paymentMethod = ref('wechat')
 const countdown = ref(15 * 60)
+const payError = ref('')
 
 let countdownInterval = null
+
+// 幂等支付提交器：重复点击只产生一次真实请求，已支付订单按成功处理
+const paymentSubmitter = createPaymentSubmitter({ payApi: payOrder })
 
 const seatsText = computed(() => {
   return seats.value
@@ -156,6 +167,7 @@ const startCountdown = () => {
 
 const loadOrder = async () => {
   loading.value = true
+  error.value = ''
   try {
     const res = await ticketStore.getOrderDetailAction(route.params.orderNo)
     order.value = res.order
@@ -166,16 +178,13 @@ const loadOrder = async () => {
       return
     }
     
-    const created = new Date(res.order.created_at)
-    const now = new Date()
-    const diff = Math.floor((now - created) / 1000)
-    countdown.value = Math.max(0, 15 * 60 - diff)
+    countdown.value = getRemainingSeconds(res.order)
     
     if (countdown.value > 0) {
       startCountdown()
     }
   } catch (err) {
-    error.value = err.message || '加载订单失败'
+    error.value = classifyApiError(err).message
   } finally {
     loading.value = false
   }
@@ -183,17 +192,22 @@ const loadOrder = async () => {
 
 const handlePayment = async () => {
   if (countdown.value <= 0) {
-    alert('订单已过期，请重新下单')
+    payError.value = '订单已过期，请重新下单'
     return
   }
   
   processing.value = true
+  payError.value = ''
   try {
-    await ticketStore.payOrderAction(route.params.orderNo)
-    alert('支付成功！')
+    await paymentSubmitter.submit(route.params.orderNo)
     router.push(`/order/${route.params.orderNo}`)
   } catch (err) {
-    alert(err.message || '支付失败')
+    if (err && err.code === 'ORDER_EXPIRED') {
+      countdown.value = 0
+      payError.value = '订单已过期，座位锁定已释放，请重新下单'
+    } else {
+      payError.value = classifyApiError(err).message
+    }
   } finally {
     processing.value = false
   }
@@ -389,5 +403,18 @@ onUnmounted(() => {
 .error-text {
   color: #ff6b6b;
   margin-bottom: 24px;
+}
+
+.error-actions {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+}
+
+.pay-error {
+  margin-top: 16px;
+  text-align: center;
+  color: #ff6b6b;
+  font-size: 14px;
 }
 </style>
