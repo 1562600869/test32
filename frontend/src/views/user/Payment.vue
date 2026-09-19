@@ -10,10 +10,13 @@
           <div class="spinner"></div>
         </div>
 
-        <div v-else-if="error" class="error-section">
+        <div v-else-if="error" class="error-section" role="alert">
           <div class="error-icon">❌</div>
           <p class="error-text">{{ error }}</p>
-          <button class="btn btn-primary" @click="goHome">返回首页</button>
+          <div class="error-actions">
+            <button class="btn btn-primary" @click="loadOrder">重试</button>
+            <button class="btn btn-secondary" @click="goHome">返回首页</button>
+          </div>
         </div>
 
         <div v-else class="payment-content">
@@ -84,6 +87,11 @@
             </div>
           </div>
 
+          <div v-if="payError" class="pay-error" role="alert">
+            <span>{{ payError }}</span>
+            <button class="btn btn-secondary btn-sm" @click="recheckOrder">重新查询订单状态</button>
+          </div>
+
           <div class="payment-actions">
             <button class="btn btn-secondary" @click="cancelOrder" :disabled="processing">
               取消订单
@@ -120,6 +128,7 @@ const error = ref('')
 const processing = ref(false)
 const paymentMethod = ref('wechat')
 const countdown = ref(15 * 60)
+const payError = ref('')
 
 let countdownInterval = null
 
@@ -156,6 +165,7 @@ const startCountdown = () => {
 
 const loadOrder = async () => {
   loading.value = true
+  error.value = ''
   try {
     const res = await ticketStore.getOrderDetailAction(route.params.orderNo)
     order.value = res.order
@@ -166,11 +176,13 @@ const loadOrder = async () => {
       return
     }
     
-    const created = new Date(res.order.created_at)
-    const now = new Date()
-    const diff = Math.floor((now - created) / 1000)
-    countdown.value = Math.max(0, 15 * 60 - diff)
+    // 锁定 TTL 以服务端 expires_at 为准（默认 15 分钟）
+    const expireAt = res.order.expires_at
+      ? new Date(res.order.expires_at.replace(' ', 'T'))
+      : new Date(new Date(res.order.created_at.replace(' ', 'T')).getTime() + 15 * 60 * 1000)
+    countdown.value = Math.max(0, Math.floor((expireAt - Date.now()) / 1000))
     
+    if (countdownInterval) clearInterval(countdownInterval)
     if (countdown.value > 0) {
       startCountdown()
     }
@@ -181,19 +193,50 @@ const loadOrder = async () => {
   }
 }
 
+// 支付结果不确定时（网络错误/超时），以服务端订单状态为准重新查询。
+// 返回订单状态；查询失败返回 null。
+const recheckOrder = async () => {
+  payError.value = ''
+  try {
+    const res = await ticketStore.getOrderDetailAction(route.params.orderNo)
+    if (res.order.status !== 'pending') {
+      router.push(`/order/${res.order.order_no}`)
+      return res.order.status
+    }
+    order.value = res.order
+    seats.value = res.seats
+    return res.order.status
+  } catch (err) {
+    payError.value = `查询订单状态失败：${err.message}`
+    return null
+  }
+}
+
 const handlePayment = async () => {
   if (countdown.value <= 0) {
-    alert('订单已过期，请重新下单')
+    payError.value = '订单已过期，请重新下单'
     return
   }
   
   processing.value = true
+  payError.value = ''
   try {
+    // 支付幂等：重复点击/重复提交不会产生第二笔有效票
     await ticketStore.payOrderAction(route.params.orderNo)
-    alert('支付成功！')
     router.push(`/order/${route.params.orderNo}`)
   } catch (err) {
-    alert(err.message || '支付失败')
+    if (err.code === 'NETWORK_ERROR' || err.code === 'TIMEOUT') {
+      // 结果不确定：可能已支付成功，以服务端为准重新查询
+      const status = await recheckOrder()
+      if (status === null) {
+        payError.value = '网络异常，支付结果未知。请点击"重新查询订单状态"确认，切勿重复支付。'
+      } else if (status === 'pending') {
+        payError.value = '支付未完成（网络异常），订单仍有效，可重新支付。'
+      }
+      // 其他状态已自动跳转
+    } else {
+      payError.value = err.message || '支付失败'
+    }
   } finally {
     processing.value = false
   }
@@ -389,5 +432,25 @@ onUnmounted(() => {
 .error-text {
   color: #ff6b6b;
   margin-bottom: 24px;
+}
+
+.error-actions {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+}
+
+.pay-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 20px;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  border-radius: 8px;
+  color: #ffb3b3;
+  font-size: 14px;
 }
 </style>

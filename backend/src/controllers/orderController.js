@@ -1,12 +1,24 @@
 const pool = require('../database');
 const { generateOrderNo } = require('../utils/orderNo');
+const { LOCK_TTL_MS } = require('../config');
+const { SeatConflictError, OrderStateError } = require('../errors');
 
-const createOrder = async (req, res) => {
+// 订单状态机：pending(已锁定) -> paid / expired / cancelled
+// - 锁定带 TTL（LOCK_TTL_MINUTES，默认 15 分钟），过期自动释放座位
+// - 支付幂等：重复支付同一已支付订单返回相同成功结果，不产生第二笔票
+
+const formatDateTime = (date) => {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+
+const createOrder = async (req, res, next) => {
   const { showtime_id, seat_ids } = req.body;
   const userId = req.user.id;
 
   if (!showtime_id || !seat_ids || !Array.isArray(seat_ids) || seat_ids.length === 0) {
-    return res.status(400).json({ message: '请选择座位' });
+    return res.status(400).json({ message: '请选择座位', code: 'INVALID_SEAT_SELECTION' });
   }
 
   const connection = await pool.getConnection();
@@ -20,15 +32,15 @@ const createOrder = async (req, res) => {
 
     if (showtimes.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ message: '场次不存在' });
+      return res.status(404).json({ message: '场次不存在', code: 'SHOWTIME_NOT_FOUND' });
     }
 
     const showtime = showtimes[0];
 
     const placeholders = seat_ids.map(() => '?').join(',');
     const [seats] = await connection.query(
-      `SELECT sl.*, 
-              CASE WHEN os.id IS NOT NULL AND os.status IN ('reserved', 'sold') THEN true ELSE false END as is_sold
+      `SELECT sl.*,
+              CASE WHEN os.id IS NOT NULL THEN true ELSE false END as is_sold
        FROM seat_layouts sl
        LEFT JOIN order_seats os ON sl.id = os.seat_id AND os.showtime_id = ? AND os.status IN ('reserved', 'sold')
        WHERE sl.id IN (${placeholders})`,
@@ -37,36 +49,46 @@ const createOrder = async (req, res) => {
 
     if (seats.length !== seat_ids.length) {
       await connection.rollback();
-      return res.status(400).json({ message: '存在无效座位' });
+      return res.status(400).json({ message: '存在无效座位', code: 'INVALID_SEAT_SELECTION' });
     }
 
-    const unavailableSeats = seats.filter(s => s.is_sold);
+    const unavailableSeats = seats.filter((s) => s.is_sold);
     if (unavailableSeats.length > 0) {
       await connection.rollback();
-      return res.status(400).json({ 
-        message: '部分座位已被售出',
-        unavailable_seats: unavailableSeats.map(s => ({
-          row: s.row_number,
-          col: s.col_number
-        }))
-      });
+      throw new SeatConflictError(
+        showtime_id,
+        unavailableSeats.map((s) => ({ row: s.row_number, col: s.col_number }))
+      );
     }
 
     const totalAmount = showtime.ticket_price * seat_ids.length;
     const orderNo = generateOrderNo();
+    const expiresAt = formatDateTime(new Date(Date.now() + LOCK_TTL_MS));
 
     const [orderResult] = await connection.query(
-      'INSERT INTO orders (order_no, user_id, showtime_id, total_amount, status, version) VALUES (?, ?, ?, ?, ?, ?)',
-      [orderNo, userId, showtime_id, totalAmount, 'pending', 0]
+      'INSERT INTO orders (order_no, user_id, showtime_id, total_amount, status, version, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [orderNo, userId, showtime_id, totalAmount, 'pending', 0, expiresAt]
     );
 
     const orderId = orderResult.insertId;
-    const orderSeatValues = seat_ids.map(seatId => [orderId, showtime_id, seatId, 'reserved', 0]);
+    const orderSeatValues = seat_ids.map((seatId) => [orderId, showtime_id, seatId, 'reserved', 0]);
 
-    await connection.query(
-      'INSERT INTO order_seats (order_id, showtime_id, seat_id, status, version) VALUES ?',
-      [orderSeatValues]
-    );
+    try {
+      // unique_showtime_seat(showtime_id, seat_id, status) 保证并发下最多一人锁定成功
+      await connection.query(
+        'INSERT INTO order_seats (order_id, showtime_id, seat_id, status, version) VALUES ?',
+        [orderSeatValues]
+      );
+    } catch (insertError) {
+      await connection.rollback();
+      if (insertError.code === 'ER_DUP_ENTRY') {
+        throw new SeatConflictError(
+          showtime_id,
+          seats.map((s) => ({ row: s.row_number, col: s.col_number }))
+        );
+      }
+      throw insertError;
+    }
 
     await connection.commit();
 
@@ -77,7 +99,8 @@ const createOrder = async (req, res) => {
         order_no: orderNo,
         total_amount: totalAmount,
         status: 'pending',
-        seats: seats.map(s => ({
+        expires_at: expiresAt,
+        seats: seats.map((s) => ({
           id: s.id,
           row: s.row_number,
           col: s.col_number,
@@ -86,20 +109,14 @@ const createOrder = async (req, res) => {
       }
     });
   } catch (error) {
-    await connection.rollback();
-    console.error(error);
-    
-    if (error.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ message: '座位已被其他用户锁定，请重新选择' });
-    }
-    
-    res.status(500).json({ message: '服务器内部错误' });
+    try { await connection.rollback(); } catch (e) { /* already rolled back */ }
+    next(error);
   } finally {
     connection.release();
   }
 };
 
-const payOrder = async (req, res) => {
+const payOrder = async (req, res, next) => {
   const { order_no } = req.params;
   const userId = req.user.id;
 
@@ -114,66 +131,66 @@ const payOrder = async (req, res) => {
 
     if (orders.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ message: '订单不存在' });
+      return res.status(404).json({ message: '订单不存在', code: 'ORDER_NOT_FOUND' });
     }
 
     const order = orders[0];
 
-    if (order.status !== 'pending') {
-      await connection.rollback();
-      return res.status(400).json({ message: '订单状态不允许支付' });
+    // 幂等：重复支付已支付订单直接返回成功，不生成第二笔票
+    if (order.status === 'paid') {
+      await connection.commit();
+      return res.json({ message: '支付成功', order_no, already_paid: true });
     }
 
-    const currentTime = new Date();
-    const orderTime = new Date(order.created_at);
-    const diffMinutes = (currentTime - orderTime) / (1000 * 60);
+    if (order.status !== 'pending') {
+      await connection.rollback();
+      throw new OrderStateError(order_no, order.status, 'pay');
+    }
 
-    if (diffMinutes > 15) {
+    const expired =
+      (order.expires_at && new Date(order.expires_at).getTime() <= Date.now()) ||
+      Date.now() - new Date(order.created_at).getTime() > LOCK_TTL_MS;
+
+    if (expired) {
       await connection.query(
-        'UPDATE orders SET status = ? WHERE id = ?',
-        ['cancelled', order.id]
+        "UPDATE orders SET status = 'expired', version = version + 1 WHERE id = ? AND status = 'pending'",
+        [order.id]
       );
       await connection.query(
-        'UPDATE order_seats SET status = ? WHERE order_id = ?',
-        ['cancelled', order.id]
+        "UPDATE order_seats SET status = 'cancelled', version = version + 1 WHERE order_id = ? AND status = 'reserved'",
+        [order.id]
       );
       await connection.commit();
-      return res.status(400).json({ message: '订单已超时取消' });
+      throw new OrderStateError(order_no, 'expired', 'pay');
     }
 
     const [updateResult] = await connection.query(
-      'UPDATE orders SET status = ?, paid_at = ?, version = version + 1 WHERE id = ? AND version = ?',
-      ['paid', new Date(), order.id, order.version]
+      "UPDATE orders SET status = 'paid', paid_at = NOW(), version = version + 1 WHERE id = ? AND status = 'pending' AND version = ?",
+      [order.id, order.version]
     );
 
     if (updateResult.affectedRows === 0) {
       await connection.rollback();
-      return res.status(400).json({ message: '订单已被其他操作处理，请重试' });
+      throw new OrderStateError(order_no, order.status, 'pay');
     }
 
-    const [seatUpdateResult] = await connection.query(
-      'UPDATE order_seats SET status = ?, version = version + 1 WHERE order_id = ? AND status = ?',
-      ['sold', order.id, 'reserved']
+    await connection.query(
+      "UPDATE order_seats SET status = 'sold', version = version + 1 WHERE order_id = ? AND status = 'reserved'",
+      [order.id]
     );
-
-    if (seatUpdateResult.affectedRows === 0) {
-      await connection.rollback();
-      return res.status(400).json({ message: '座位状态异常，请联系客服' });
-    }
 
     await connection.commit();
 
     res.json({ message: '支付成功', order_no });
   } catch (error) {
-    await connection.rollback();
-    console.error(error);
-    res.status(500).json({ message: '服务器内部错误' });
+    try { await connection.rollback(); } catch (e) { /* already rolled back */ }
+    next(error);
   } finally {
     connection.release();
   }
 };
 
-const cancelOrder = async (req, res) => {
+const cancelOrder = async (req, res, next) => {
   const { order_no } = req.params;
   const userId = req.user.id;
 
@@ -182,20 +199,26 @@ const cancelOrder = async (req, res) => {
     await connection.beginTransaction();
 
     const [orders] = await connection.query(
-      'SELECT * FROM orders WHERE order_no = ? AND user_id = ?',
+      'SELECT * FROM orders WHERE order_no = ? AND user_id = ? FOR UPDATE',
       [order_no, userId]
     );
 
     if (orders.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ message: '订单不存在' });
+      return res.status(404).json({ message: '订单不存在', code: 'ORDER_NOT_FOUND' });
     }
 
     const order = orders[0];
 
+    // 幂等：重复取消返回成功
+    if (order.status === 'cancelled') {
+      await connection.commit();
+      return res.json({ message: '订单取消成功', already_cancelled: true });
+    }
+
     if (order.status !== 'pending' && order.status !== 'paid') {
       await connection.rollback();
-      return res.status(400).json({ message: '当前订单状态无法取消' });
+      throw new OrderStateError(order_no, order.status, 'cancel');
     }
 
     const [updateResult] = await connection.query(
@@ -205,21 +228,20 @@ const cancelOrder = async (req, res) => {
 
     if (updateResult.affectedRows === 0) {
       await connection.rollback();
-      return res.status(400).json({ message: '订单已被其他操作处理，请重试' });
+      throw new OrderStateError(order_no, order.status, 'cancel');
     }
 
     await connection.query(
-      'UPDATE order_seats SET status = ?, version = version + 1 WHERE order_id = ?',
-      ['cancelled', order.id]
+      "UPDATE order_seats SET status = 'cancelled', version = version + 1 WHERE order_id = ? AND status IN ('reserved', 'sold')",
+      [order.id]
     );
 
     await connection.commit();
 
     res.json({ message: '订单取消成功' });
   } catch (error) {
-    await connection.rollback();
-    console.error(error);
-    res.status(500).json({ message: '服务器内部错误' });
+    try { await connection.rollback(); } catch (e) { /* already rolled back */ }
+    next(error);
   } finally {
     connection.release();
   }
@@ -253,7 +275,7 @@ const getOrders = async (req, res) => {
     res.json({ orders });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: '服务器内部错误' });
+    res.status(500).json({ message: '服务器内部错误', code: 'INTERNAL_ERROR' });
   }
 };
 
@@ -274,7 +296,7 @@ const getOrderDetail = async (req, res) => {
     `, [order_no, userId]);
 
     if (orders.length === 0) {
-      return res.status(404).json({ message: '订单不存在' });
+      return res.status(404).json({ message: '订单不存在', code: 'ORDER_NOT_FOUND' });
     }
 
     const order = orders[0];
@@ -288,7 +310,7 @@ const getOrderDetail = async (req, res) => {
     res.json({ order, seats });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: '服务器内部错误' });
+    res.status(500).json({ message: '服务器内部错误', code: 'INTERNAL_ERROR' });
   }
 };
 

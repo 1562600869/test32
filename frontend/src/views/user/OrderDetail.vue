@@ -98,6 +98,7 @@ const statusMap = {
   pending: { text: '待支付', class: 'pending' },
   paid: { text: '已支付', class: 'paid' },
   cancelled: { text: '已取消', class: 'cancelled' },
+  expired: { text: '已过期', class: 'cancelled' },
   refunded: { text: '已退款', class: 'refunded' }
 }
 

@@ -7,17 +7,43 @@
         <p class="showtime-info">{{ formatTime(showtime?.start_time) }} - {{ formatTime(showtime?.end_time) }}</p>
       </div>
 
-      <div v-if="loading" class="loading">
+      <div v-if="viewState.type === 'loading'" class="loading">
         <div class="spinner"></div>
       </div>
 
+      <div v-else-if="viewState.type === 'error'" class="error-state" role="alert">
+        <div class="error-icon">⚠️</div>
+        <p class="error-text">{{ viewState.message }}</p>
+        <button class="btn btn-primary" @click="loadData">重试</button>
+      </div>
+
+      <div v-else-if="viewState.type === 'empty'" class="empty-state">
+        <div class="empty-icon">💺</div>
+        <p class="empty-text">该场次暂无可售座位</p>
+        <button class="btn btn-secondary" @click="loadData">刷新</button>
+      </div>
+
       <div v-else class="seat-container">
+        <div
+          v-if="conflictError"
+          class="conflict-banner"
+          role="alert"
+        >
+          <span>{{ conflictError }}</span>
+          <button class="btn btn-secondary btn-sm" @click="dismissConflict">知道了</button>
+        </div>
+
         <div class="screen">
           <div class="screen-label">银 幕</div>
         </div>
 
         <div class="seat-map-wrapper">
-          <svg :viewBox="svgViewBox" class="seat-map">
+          <svg
+            :viewBox="svgViewBox"
+            class="seat-map"
+            role="group"
+            aria-label="座位图，使用方向键上方格键或回车选择座位"
+          >
             <g v-for="row in rows" :key="'row-' + row">
               <text 
                 :x="labelX" 
@@ -34,7 +60,15 @@
               v-for="seat in seats" 
               :key="seat.id"
               class="seat-group"
+              :class="{ disabled: seat.is_sold }"
+              :tabindex="seat.is_sold ? -1 : 0"
+              role="checkbox"
+              :aria-checked="ticketStore.isSeatSelected(seat.id)"
+              :aria-disabled="seat.is_sold"
+              :aria-label="getSeatAriaLabel(seat)"
               @click="handleSeatClick(seat)"
+              @keydown.enter.prevent="handleSeatClick(seat)"
+              @keydown.space.prevent="handleSeatClick(seat)"
             >
               <rect
                 :x="getSeatX(seat.col_number)"
@@ -51,6 +85,7 @@
                 class="seat-number"
                 text-anchor="middle"
                 dominant-baseline="middle"
+                aria-hidden="true"
               >
                 {{ seat.col_number }}
               </text>
@@ -58,7 +93,7 @@
           </svg>
         </div>
 
-        <div class="legend">
+        <div class="legend" aria-hidden="true">
           <div class="legend-item">
             <div class="legend-seat available"></div>
             <span>可选</span>
@@ -78,7 +113,7 @@
         </div>
       </div>
 
-      <div class="order-summary card">
+      <div class="order-summary card" v-if="viewState.type === 'ready'">
         <div class="summary-content">
           <div class="summary-info">
             <div class="selected-seats">
@@ -88,9 +123,9 @@
               </span>
               <span class="empty-text" v-else>请选择座位</span>
             </div>
-            <div class="seat-count">
+            <div class="seat-count" aria-live="polite" role="status">
               <span class="label">数量：</span>
-              <span>{{ ticketStore.selectedSeats.length }} 张</span>
+              <span>{{ selectionSummaryText }}</span>
             </div>
           </div>
           <div class="summary-price">
@@ -116,6 +151,15 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getShowtimeById } from '../../api/showtime'
 import { useTicketStore } from '../../stores/ticket'
+import { SeatConflictError, describeError } from '../../utils/errors'
+import { resolveViewState } from '../../utils/uiState'
+import {
+  seatState,
+  seatAriaLabel,
+  selectionSummary,
+  removeConflictSeats,
+  reconcileSelection
+} from '../../utils/seatMap'
 
 const route = useRoute()
 const router = useRouter()
@@ -124,12 +168,18 @@ const ticketStore = useTicketStore()
 const showtime = ref(null)
 const seats = ref([])
 const loading = ref(true)
+const loadError = ref(null)
+const conflictError = ref('')
 const processing = ref(false)
 
 const seatWidth = 32
 const seatHeight = 32
 const seatGap = 8
 const labelWidth = 60
+
+const viewState = computed(() =>
+  resolveViewState({ loading: loading.value, error: loadError.value, data: seats.value })
+)
 
 const rows = computed(() => {
   if (seats.value.length === 0) return []
@@ -169,23 +219,22 @@ const getSeatY = (row) => {
 
 const getSeatClass = (seat) => {
   const classes = ['seat']
-  
-  if (seat.is_sold) {
-    classes.push('sold')
-  } else if (ticketStore.isSeatSelected(seat.id)) {
-    classes.push('selected')
-    if (seat.seat_type === 'vip') classes.push('vip-selected')
-  } else if (seat.seat_type === 'vip') {
-    classes.push('vip')
-  } else {
-    classes.push('available')
-  }
-  
+  const state = seatState(seat, ticketStore.isSeatSelected(seat.id))
+  classes.push(state)
+  if (state === 'selected' && seat.seat_type === 'vip') classes.push('vip-selected')
+  if (state === 'available' && seat.seat_type === 'vip') classes.push('vip')
   return classes
 }
 
+const getSeatAriaLabel = (seat) => {
+  return seatAriaLabel(seat, seatState(seat, ticketStore.isSeatSelected(seat.id)))
+}
+
+const selectionSummaryText = computed(() => selectionSummary(ticketStore.selectedSeats.length))
+
 const selectedSeatsText = computed(() => {
   return ticketStore.selectedSeats
+    .slice()
     .sort((a, b) => {
       if (a.row_number !== b.row_number) return a.row_number - b.row_number
       return a.col_number - b.col_number
@@ -201,46 +250,81 @@ const formatTime = (datetime) => {
 
 const handleSeatClick = (seat) => {
   if (seat.is_sold) return
+  conflictError.value = ''
   ticketStore.toggleSeat(seat)
+}
+
+const dismissConflict = () => {
+  conflictError.value = ''
 }
 
 const confirmOrder = async () => {
   if (ticketStore.selectedSeats.length === 0) return
   
   processing.value = true
+  conflictError.value = ''
   try {
     const order = await ticketStore.createOrderAction()
     router.push(`/payment/${order.order_no}`)
   } catch (error) {
-    alert(error.message || '创建订单失败，请重试')
-    console.error(error)
+    if (error instanceof SeatConflictError) {
+      // 409 冲突：展示含场次 ID 与座位坐标的诊断信息，
+      // 移除冲突座位并刷新座位图，回到服务端真实状态
+      conflictError.value = describeError(error)
+      ticketStore.selectedSeats = removeConflictSeats(
+        ticketStore.selectedSeats,
+        error.seats
+      )
+      await loadData({ silent: true })
+    } else {
+      conflictError.value = `${error.message || '创建订单失败'}（可重试）`
+    }
   } finally {
     processing.value = false
   }
 }
 
-const loadData = async () => {
-  loading.value = true
+const loadData = async ({ silent = false } = {}) => {
+  if (!silent) {
+    loading.value = true
+    loadError.value = null
+  }
   try {
     const res = await getShowtimeById(route.params.id)
     showtime.value = res.showtime
     seats.value = res.seats
-    ticketStore.setShowtime(res.showtime)
+    ticketStore.setShowtime(res.showtime, { keepSelection: true })
+    // 以服务端为准重算本地已选：已售/被锁座位从本地已选中剔除
+    ticketStore.selectedSeats = reconcileSelection(ticketStore.selectedSeats, res.seats)
+    loadError.value = null
   } catch (error) {
-    console.error('加载数据失败:', error)
-    alert('加载数据失败，请重试')
+    if (silent) {
+      conflictError.value = conflictError.value || `刷新座位图失败：${error.message}`
+    } else {
+      loadError.value = error
+    }
   } finally {
     loading.value = false
+  }
+}
+
+// 跨标签页规则：已选状态以服务端为准。窗口重新聚焦时刷新座位图，
+// 其他标签页的锁定/出票会反映到本页；本地未提交的"已选"不覆盖服务端。
+const handleWindowFocus = () => {
+  if (viewState.value.type !== 'loading') {
+    loadData({ silent: true })
   }
 }
 
 onMounted(() => {
   ticketStore.clearSelection()
   loadData()
+  window.addEventListener('focus', handleWindowFocus)
 })
 
 onUnmounted(() => {
   ticketStore.clearSelection()
+  window.removeEventListener('focus', handleWindowFocus)
 })
 </script>
 
@@ -252,6 +336,42 @@ onUnmounted(() => {
 .showtime-info {
   color: #888 !important;
   margin-top: 8px;
+}
+
+.error-state,
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+}
+
+.error-icon,
+.empty-icon {
+  font-size: 56px;
+  margin-bottom: 16px;
+}
+
+.error-text {
+  color: #ff6b6b;
+  margin-bottom: 24px;
+}
+
+.empty-text {
+  color: #888;
+  margin-bottom: 24px;
+}
+
+.conflict-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 20px;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  border-radius: 8px;
+  color: #ffb3b3;
+  font-size: 14px;
 }
 
 .seat-container {
@@ -304,6 +424,16 @@ onUnmounted(() => {
 
 .seat-group {
   cursor: pointer;
+  outline: none;
+}
+
+.seat-group:focus-visible .seat {
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.seat-group.disabled {
+  cursor: not-allowed;
 }
 
 .seat {
@@ -336,7 +466,8 @@ onUnmounted(() => {
   stroke: #f4d03f;
 }
 
-.seat.sold {
+.seat.sold,
+.seat.locked {
   fill: #1a1a2e;
   stroke: #2d2d44;
   cursor: not-allowed;

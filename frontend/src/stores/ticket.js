@@ -19,9 +19,12 @@ export const useTicketStore = defineStore('ticket', () => {
     selectedSeats.value = []
   }
 
-  const setShowtime = (showtime) => {
+  // keepSelection: 刷新座位图时保留本地已选（由调用方用服务端数据重算）
+  const setShowtime = (showtime, { keepSelection = false } = {}) => {
     selectedShowtime.value = showtime
-    selectedSeats.value = []
+    if (!keepSelection) {
+      selectedSeats.value = []
+    }
   }
 
   const toggleSeat = (seat) => {

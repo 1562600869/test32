@@ -106,11 +106,16 @@ const statusMap = {
   pending: { text: '待支付', class: 'pending' },
   paid: { text: '已支付', class: 'paid' },
   cancelled: { text: '已取消', class: 'cancelled' },
+  expired: { text: '已过期', class: 'cancelled' },
   refunded: { text: '已退款', class: 'refunded' }
 }
 
 const filteredOrders = computed(() => {
   if (activeTab.value === 'all') return orders.value
+  // 已过期订单归入"已取消"标签页展示
+  if (activeTab.value === 'cancelled') {
+    return orders.value.filter(o => o.status === 'cancelled' || o.status === 'expired')
+  }
   return orders.value.filter(o => o.status === activeTab.value)
 })
 

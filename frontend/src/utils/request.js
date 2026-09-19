@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { normalizeApiError } from './errors'
 
 const request = axios.create({
   baseURL: '/api',
@@ -23,17 +24,15 @@ request.interceptors.response.use(
     return response.data
   },
   (error) => {
-    if (error.response) {
-      if (error.response.status === 401) {
-        localStorage.removeItem('token')
-        localStorage.removeItem('user')
-        if (window.location.pathname !== '/login' && !window.location.pathname.startsWith('/admin')) {
-          window.location.href = '/login'
-        }
+    if (error.response && error.response.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('user')
+      if (window.location.pathname !== '/login' && !window.location.pathname.startsWith('/admin')) {
+        window.location.href = '/login'
       }
-      return Promise.reject(error.response.data || { message: '请求失败' })
     }
-    return Promise.reject({ message: '网络错误，请稍后重试' })
+    // 统一归一化为公开错误类型（ApiError/NetworkError/TimeoutError/SeatConflictError/ConflictError）
+    return Promise.reject(normalizeApiError(error))
   }
 )
 
